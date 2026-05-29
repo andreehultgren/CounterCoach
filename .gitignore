@@ -1,0 +1,16 @@
+# Dependencies & build output
+node_modules
+frontend/dist
+build/bin
+
+# Local caches (regenerated automatically)
+.tanstack
+frontend/package.json.md5
+
+# macOS / editor / tooling
+.DS_Store
+.vscode
+.claude
+
+# Demo files (large, not source)
+demos
