@@ -20,7 +20,10 @@ To build a redistributable, production mode package, use `wails build`.
 
 ## Downloads
 
-Grab the latest `countercoach.exe` from the [Releases](../../releases) page.
+Grab the latest build from the [Releases](../../releases) page:
+
+- **macOS** — `countercoach-macos-universal.zip` (signed + notarized; Apple Silicon + Intel). Unzip, drag `countercoach.app` to Applications, open. No warning.
+- **Windows** — `countercoach.exe` (unsigned, see below).
 
 ### Windows SmartScreen warning
 
@@ -46,7 +49,7 @@ Compare the output to the checksum on the release page — they must match.
 ## Releases (CI)
 
 Pushing a tag like `v1.0.0` triggers `.github/workflows/release.yml`, which
-builds the Windows `.exe` and publishes a GitHub Release with the binary and
-its SHA256. macOS builds are on hold until an Apple Developer ID certificate
-is available (signing/notarization config is preserved in
-`build/darwin/entitlements.plist`).
+builds the macOS `.app` (signed + notarized) and the Windows `.exe`, then
+publishes a GitHub Release with both binaries and their SHA256 checksums.
+macOS signing relies on the `MACOS_*` repo secrets and the entitlements in
+`build/darwin/entitlements.plist`.

@@ -1,14 +1,21 @@
 name: Release
 
-# Build an unsigned Windows executable.
+# Build a signed/notarized macOS app and an unsigned Windows executable.
 #
 # Triggers:
-#   - push a tag like v1.0.0  -> builds + creates a GitHub Release with the .exe + SHA256
-#   - manual run (Actions tab) -> builds + uploads the .exe as an artifact only
+#   - push a tag like v1.0.0  -> builds + creates a GitHub Release with both binaries + SHA256
+#   - manual run (Actions tab) -> builds + uploads binaries as artifacts only
 #
-# The .exe is UNSIGNED. Windows SmartScreen shows a dismissable warning
-# ("More info -> Run anyway"). See README for the user-facing note + checksum verify.
-# macOS builds are skipped until an Apple Developer ID cert is available.
+# macOS  : universal .app, code-signed (Developer ID) + notarized via the repo secrets below.
+# Windows: UNSIGNED .exe. SmartScreen shows a dismissable warning ("More info -> Run anyway").
+#
+# Required macOS secrets (Settings -> Secrets and variables -> Actions):
+#   MACOS_CERTIFICATE        base64 of the "Developer ID Application" .p12
+#   MACOS_CERTIFICATE_PWD    password for that .p12
+#   MACOS_SIGNING_IDENTITY   e.g. "Developer ID Application: Name (TEAMID)"
+#   MACOS_NOTARY_APPLE_ID    Apple ID email
+#   MACOS_NOTARY_PWD         app-specific password (appleid.apple.com)
+#   MACOS_NOTARY_TEAM_ID     10-char Apple Team ID
 
 on:
   push:
@@ -25,6 +32,80 @@ env:
   APP_NAME: countercoach
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # macOS — universal .app, signed + notarized
+  # ---------------------------------------------------------------------------
+  build-macos:
+    runs-on: macos-latest
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+      MACOS_NOTARY_PWD: ${{ secrets.MACOS_NOTARY_PWD }}
+      MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Import signing certificate
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          KEYCHAIN_PWD=$(openssl rand -base64 24)
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o $RUNNER_TEMP/cert.p12
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security import $RUNNER_TEMP/cert.p12 -P "$MACOS_CERTIFICATE_PWD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
+      - name: Build (universal)
+        run: wails build -platform darwin/universal -clean
+
+      - name: Sign app
+        run: |
+          APP="build/bin/${APP_NAME}.app"
+          codesign --force --deep --options runtime --timestamp \
+            --entitlements build/darwin/entitlements.plist \
+            --sign "$MACOS_SIGNING_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Notarize app
+        run: |
+          APP="build/bin/${APP_NAME}.app"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --password "$MACOS_NOTARY_PWD" \
+            --team-id "$MACOS_NOTARY_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP"
+
+      - name: Package .app into a zip
+        run: |
+          cd build/bin
+          ditto -c -k --keepParent "${APP_NAME}.app" "${APP_NAME}-macos-universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: build/bin/${{ env.APP_NAME }}-macos-universal.zip
+
+  # ---------------------------------------------------------------------------
+  # Windows — amd64 .exe, unsigned
+  # ---------------------------------------------------------------------------
   build-windows:
     runs-on: windows-latest
     steps:
@@ -49,35 +130,46 @@ jobs:
           name: windows
           path: build/bin/${{ env.APP_NAME }}.exe
 
+  # ---------------------------------------------------------------------------
+  # Attach both binaries to a GitHub Release (only on tag pushes)
+  # ---------------------------------------------------------------------------
   release:
-    needs: [build-windows]
+    needs: [build-macos, build-windows]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: windows
           path: dist
 
       - name: Compute SHA256 and build release notes
         run: |
-          cd dist
-          SUM=$(sha256sum "${APP_NAME}.exe" | awk '{print $1}')
-          echo "$SUM  ${APP_NAME}.exe" > "${APP_NAME}.exe.sha256"
+          WIN="dist/windows/${APP_NAME}.exe"
+          MAC="dist/macos/${APP_NAME}-macos-universal.zip"
+          WIN_SUM=$(sha256sum "$WIN" | awk '{print $1}')
+          MAC_SUM=$(sha256sum "$MAC" | awk '{print $1}')
+          echo "$WIN_SUM  ${APP_NAME}.exe" > "dist/${APP_NAME}.exe.sha256"
+          echo "$MAC_SUM  ${APP_NAME}-macos-universal.zip" > "dist/${APP_NAME}-macos-universal.zip.sha256"
           {
             echo "## Downloads"
             echo ""
+            echo "**macOS** — \`${APP_NAME}-macos-universal.zip\` (signed + notarized, Apple Silicon + Intel)"
+            echo ""
+            echo "Unzip and drag \`${APP_NAME}.app\` to Applications. No security warning."
+            echo ""
             echo "**Windows** — \`${APP_NAME}.exe\` (unsigned)"
             echo ""
-            echo "Windows SmartScreen may warn on first run. Click **More info -> Run anyway** — this is expected for an unsigned app."
+            echo "SmartScreen may warn on first run. Click **More info -> Run anyway** — expected for an unsigned app."
             echo ""
             echo "### Verify your download (SHA256)"
             echo '```'
-            echo "$SUM  ${APP_NAME}.exe"
+            echo "$MAC_SUM  ${APP_NAME}-macos-universal.zip"
+            echo "$WIN_SUM  ${APP_NAME}.exe"
             echo '```'
             echo ""
-            echo "PowerShell: \`Get-FileHash ${APP_NAME}.exe -Algorithm SHA256\`"
-          } > notes.md
+            echo "macOS: \`shasum -a 256 ${APP_NAME}-macos-universal.zip\`"
+            echo "Windows (PowerShell): \`Get-FileHash ${APP_NAME}.exe -Algorithm SHA256\`"
+          } > dist/notes.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -85,5 +177,7 @@ jobs:
           body_path: dist/notes.md
           generate_release_notes: true
           files: |
-            dist/${{ env.APP_NAME }}.exe
+            dist/macos/${{ env.APP_NAME }}-macos-universal.zip
+            dist/windows/${{ env.APP_NAME }}.exe
             dist/${{ env.APP_NAME }}.exe.sha256
+            dist/${{ env.APP_NAME }}-macos-universal.zip.sha256
