@@ -249,6 +249,7 @@ export namespace models {
 	    // Go type: time
 	    UpdatedAt: any;
 	    Path: string;
+	    Hash: string;
 	    Exists: boolean;
 	    Game?: Game;
 	
@@ -262,6 +263,7 @@ export namespace models {
 	        this.CreatedAt = this.convertValues(source["CreatedAt"], null);
 	        this.UpdatedAt = this.convertValues(source["UpdatedAt"], null);
 	        this.Path = source["Path"];
+	        this.Hash = source["Hash"];
 	        this.Exists = source["Exists"];
 	        this.Game = this.convertValues(source["Game"], Game);
 	    }

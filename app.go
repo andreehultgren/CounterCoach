@@ -4,8 +4,11 @@ import (
 	"context"
 	"countercoach/analysis"
 	"countercoach/models"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -63,15 +66,11 @@ func (a *App) startup(ctx context.Context) {
 		fmt.Println("Failed to migrate database:", err)
 		return
 	}
-
-	// 4b. Drop the legacy demo "name" column — demos are now identified by their
-	//     map/result/date. AutoMigrate never removes columns, so do it explicitly
-	//     (idempotent: guarded by HasColumn).
-	if db.Migrator().HasColumn(&models.Demo{}, "Name") {
-		if err := db.Migrator().DropColumn(&models.Demo{}, "Name"); err != nil {
-			fmt.Println("Failed to drop legacy demo.name column:", err)
-		}
-	}
+	// Note: we intentionally do NOT drop the now-unused demo "name" column.
+	// Dropping a column on SQLite rebuilds the table, and with foreign_keys ON
+	// the implicit row-delete cascades into games (ON DELETE CASCADE), wiping all
+	// analysis. An orphan column is harmless — GORM ignores columns not in the
+	// struct, just like the pre-existing deleted_at/recorded_at columns.
 
 	// 5. Save the DB instance to the App struct
 	a.db = db
@@ -81,6 +80,28 @@ func (a *App) startup(ctx context.Context) {
 	//    contend on the single SQLite writer.
 	a.analyzeQueue = make(chan uint, 128)
 	go a.analysisWorker()
+
+	// 7. Self-heal: re-analyze any demos that have no stored Game (e.g. left
+	//    unanalyzed after an interrupted run). Only those whose file still exists
+	//    are queued, so missing files don't get re-tried every launch.
+	go a.enqueueUnanalyzed()
+}
+
+// enqueueUnanalyzed finds demos lacking an associated Game and, if their file is
+// present, queues them for analysis.
+func (a *App) enqueueUnanalyzed() {
+	var demos []models.Demo
+	if err := a.db.
+		Where("id NOT IN (SELECT demo_id FROM games WHERE demo_id IS NOT NULL)").
+		Find(&demos).Error; err != nil {
+		fmt.Println("Failed to scan for unanalyzed demos:", err)
+		return
+	}
+	for _, d := range demos {
+		if _, err := os.Stat(d.Path); err == nil {
+			a.enqueueAnalysis(d.ID)
+		}
+	}
 }
 
 // analysisWorker processes queued demos one at a time, persisting each result
@@ -131,16 +152,47 @@ func (a *App) Greet(name string) string {
 }
 
 
+// hashFile returns the SHA-256 of a file's contents as a hex string. Used to
+// detect duplicate demo imports independent of path/name.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // CreateDemo inserts a new demo into the DB and kicks off analysis in the
 // background. The demo is returned immediately; the parsed Game lands later and
-// the UI is notified via the "demo:analyzed" event. Demos are identified by
-// their file path and, once analyzed, by the match's map/result/date.
+// the UI is notified via the "demo:analyzed" event.
+//
+// Duplicate imports are ignored: if a demo with the same content hash (or, for
+// legacy demos without a hash, the same path) already exists, the existing
+// record is returned and nothing new is created or queued.
 func (a *App) CreateDemo(path string) (models.Demo, error) {
-	demo := models.Demo{Path: path}
+	// Content hash for dedup; if the file can't be read, fall back to path only.
+	hash, _ := hashFile(path)
 
-	result := a.db.Create(&demo)
-	if result.Error != nil {
-		return models.Demo{}, result.Error
+	var existing models.Demo
+	query := a.db.Where("path = ?", path)
+	if hash != "" {
+		query = a.db.Where("hash = ? OR path = ?", hash, path)
+	}
+	if err := query.First(&existing).Error; err == nil {
+		return existing, nil // already imported — ignore the duplicate
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return models.Demo{}, err
+	}
+
+	demo := models.Demo{Path: path, Hash: hash}
+	if err := a.db.Create(&demo).Error; err != nil {
+		return models.Demo{}, err
 	}
 
 	a.enqueueAnalysis(demo.ID)

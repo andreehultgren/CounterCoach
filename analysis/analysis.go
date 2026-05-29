@@ -641,8 +641,23 @@ func ParseDemo(demoPath string, verbose bool ) GameStats{
 		stats[e.Attacker.SteamID64] = *s
 	})
 
-	// Round-by-round results. Skip warmup / knife rounds (not part of the match)
-	// and draws (no winning side).
+	// Round-by-round results. CS2 demos can emit spurious RoundEnd events (e.g. a
+	// duplicated end, or FACEIT/knife-round artifacts at match start), which
+	// over-counts the score — typically by one round, attributed to whichever
+	// team "won" the phantom. The reliable delimiter is RoundEndOfficial: we keep
+	// only the LAST RoundEnd before each official end, so duplicates within a
+	// single round collapse into one. (The final round's official end is often
+	// cut off when the demo stops at match point — that leftover is flushed after
+	// parsing, see commitRound() below.)
+	var pendingRound *RoundResult
+	commitRound := func() {
+		if pendingRound == nil {
+			return
+		}
+		pendingRound.Number = len(game.Rounds) + 1
+		game.Rounds = append(game.Rounds, *pendingRound)
+		pendingRound = nil
+	}
 	p.RegisterEventHandler(func(e events.RoundEnd) {
 		gs := p.GameState()
 		if gs.IsWarmupPeriod() || !gs.IsMatchStarted() {
@@ -661,18 +676,28 @@ func ParseDemo(demoPath string, verbose bool ) GameStats{
 			loserClan = e.LoserState.ClanName()
 		}
 
-		game.Rounds = append(game.Rounds, RoundResult{
-			Number:     len(game.Rounds) + 1,
+		// Overwrite any un-committed pending round: only the last RoundEnd before
+		// the official end reflects the round's true result.
+		pendingRound = &RoundResult{
 			WinnerSide: side,
 			WinnerClan: e.WinnerState.ClanName(),
 			LoserClan:  loserClan,
 			Reason:     roundEndReasonString(e.Reason),
-		})
+		}
+	})
+	// A round is only final once it has 'officially' ended; commit the pending
+	// result then. Spurious RoundEnds without a following official are discarded.
+	p.RegisterEventHandler(func(events.RoundEndOfficial) {
+		commitRound()
 	})
 
 	if err := p.ParseToEnd(); err != nil {
 		log.Panic("failed to parse demo: ", err)
 	}
+
+	// Flush the final round: its official end is usually cut off when the demo
+	// stops at match point, leaving it pending.
+	commitRound()
 
 	// Aggregate per-team totals from the rounds. Keyed by clan name so the totals
 	// are correct across the halftime side-swap. Insertion order preserved so the

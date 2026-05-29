@@ -11,7 +11,7 @@ import type { models } from "../../wailsjs/go/models";
 
 type DemoContextType = {
 	demos: models.Demo[];
-	addDemo: (path: string) => void;
+	addDemo: (path: string) => Promise<void>;
 	updateDemo: (id: number, path: string) => void;
 	deleteDemo: (id: number) => void;
 	updateDemos: () => void;
@@ -23,7 +23,7 @@ type IProps = {
 
 const DemoContext = createContext<DemoContextType>({
 	demos: [],
-	addDemo: () => {},
+	addDemo: async () => {},
 	updateDemo: () => {},
 	deleteDemo: () => {},
 	updateDemos: () => {},
@@ -36,8 +36,9 @@ export function DemoProvider({ children }: IProps) {
 		GetDemos().then(setDemos);
 	}
 
-	function addDemo(path: string) {
-		CreateDemo(path).then(updateDemos);
+	async function addDemo(path: string) {
+		await CreateDemo(path);
+		updateDemos();
 	}
 
 	function updateDemo(id: number, path: string) {

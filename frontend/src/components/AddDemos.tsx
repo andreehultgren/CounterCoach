@@ -10,8 +10,9 @@ export default function AddDemos() {
 		const files = await SelectDemoFiles();
 		if (!files || files.length === 0) return;
 		// Demos no longer carry a name — import each path directly; the analysis
-		// (map, result, date) identifies them.
-		for (const path of files) addDemo(path);
+		// (map, result, date) identifies them. Sequential so duplicate-content
+		// files selected together are deduped one at a time.
+		for (const path of files) await addDemo(path);
 	}
 
 	return (

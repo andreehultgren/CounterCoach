@@ -1,0 +1,89 @@
+name: Release
+
+# Build an unsigned Windows executable.
+#
+# Triggers:
+#   - push a tag like v1.0.0  -> builds + creates a GitHub Release with the .exe + SHA256
+#   - manual run (Actions tab) -> builds + uploads the .exe as an artifact only
+#
+# The .exe is UNSIGNED. Windows SmartScreen shows a dismissable warning
+# ("More info -> Run anyway"). See README for the user-facing note + checksum verify.
+# macOS builds are skipped until an Apple Developer ID cert is available.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create the Release
+
+env:
+  GO_VERSION: "1.25.0"
+  NODE_VERSION: "20"
+  APP_NAME: countercoach
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Build
+        run: wails build -platform windows/amd64 -clean
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: build/bin/${{ env.APP_NAME }}.exe
+
+  release:
+    needs: [build-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+
+      - name: Compute SHA256 and build release notes
+        run: |
+          cd dist
+          SUM=$(sha256sum "${APP_NAME}.exe" | awk '{print $1}')
+          echo "$SUM  ${APP_NAME}.exe" > "${APP_NAME}.exe.sha256"
+          {
+            echo "## Downloads"
+            echo ""
+            echo "**Windows** — \`${APP_NAME}.exe\` (unsigned)"
+            echo ""
+            echo "Windows SmartScreen may warn on first run. Click **More info -> Run anyway** — this is expected for an unsigned app."
+            echo ""
+            echo "### Verify your download (SHA256)"
+            echo '```'
+            echo "$SUM  ${APP_NAME}.exe"
+            echo '```'
+            echo ""
+            echo "PowerShell: \`Get-FileHash ${APP_NAME}.exe -Algorithm SHA256\`"
+          } > notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: dist/notes.md
+          generate_release_notes: true
+          files: |
+            dist/${{ env.APP_NAME }}.exe
+            dist/${{ env.APP_NAME }}.exe.sha256
